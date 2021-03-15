@@ -1,0 +1,27 @@
+# env: MountainCarContinuous-v0
+# env: Pendulum-v0
+# env: BipedalWalker-v3
+env: LunarLanderContinuous-v2
+agent: DDPG
+critic:
+    hidden_size:
+        - 256
+        - 256
+actor:
+    hidden_size:
+        - 256
+        - 256
+replay_size: 100000
+batch_size: 64
+epochs: 5000
+noise_std: 0.1
+noise_type: normal
+actor_lr: 0.001
+critic_lr: 0.001
+target_network_update_rate: 0.005
+discount: 0.99
+max_steps_per_epoch: 5000
+test_after_epoch: 100
+render: False
+print_step_info: False
+log_weights: False
