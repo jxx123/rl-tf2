@@ -1,7 +1,9 @@
 import tensorflow as tf
+import numpy as np
 import gym
 from tensorflow.keras.layers import Dense, Concatenate, LSTM
 from tensorflow.keras import Model
+from collections import deque
 
 num_episodes = 100  # M
 num_steps = 1000  # T
@@ -59,7 +61,6 @@ class RNNActor(Model):
                  action_dim,
                  lstm_size,
                  dense_size,
-                 obs_dense_size,
                  action_lb=None,
                  action_ub=None,
                  name='RNNActor'):
@@ -126,20 +127,42 @@ class History:
 
 
 class RNNReplayBuffer:
-    def __init__(self, max_len):
-        pass
+    def __init__(self, obs_dim, action_dim, capacity=10000, seed=None):
+        self.obs_dim = obs_dim
+        self.action_dim = action_dim
+        self.capacity = capacity
+        self.seed = seed
+        self.buffer = deque(maxlen=self.capacity)
+        self.rng = np.random.default_rng(self.seed)
 
     def put(self, obs_history, action_history, reward_history):
-        pass
-
-    #  def append_in_sequence(self, obs, action, reward, next_obs, done):
-    #  pass
+        """
+        obs_history: Tensor, sequence_length (T) * obs_dim
+        action_history: Tensor, sequence_length (T) * action_dim
+        reward_history: Tensor, sequence_length (T) * 1
+        """
+        self.buffer.append(
+            tf.concat([obs_history, action_history, reward_history], 1))
 
     def sample(self, batch_size, replacement=True):
-        pass
+        idx = self.rng.choice(self.size(),
+                              size=batch_size,
+                              replace=replacement)
+        buffer_arr = np.array(self.buffer, dtype=object)
+        samples = buffer_arr[idx]
+        samples_tensor = tf.convert_to_tensor(samples, dtype=tf.float32)
+
+        batch_obs_history = samples_tensor[:, :, :self.obs_dim]
+        batch_action_history = samples_tensor[:, :,
+                                              self.obs_dim:(self.obs_dim +
+                                                            self.action_dim)]
+        batch_reward_history = samples_tensor[:, :, (
+            self.obs_dim + self.action_dim):(self.obs_dim + self.action_dim +
+                                             1)]
+        return batch_obs_history, batch_action_history, batch_reward_history
 
     def size(self):
-        pass
+        return len(self.buffer)
 
 
 #  def construct_histories_actions_and_rewards(sequences):
