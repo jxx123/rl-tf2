@@ -4,19 +4,28 @@ import gym
 from tensorflow.keras.layers import Dense, Concatenate, LSTM
 from tensorflow.keras import Model
 from collections import deque
+from rl_tf2.agents.utils import soft_update_weights, print_env_step_info
 
 num_episodes = 100  # M
 num_steps = 1000  # T
 # TODO: initialize env
 env_name = 'Pendulum-v0'
 env = gym.make(env_name)
-obs_dim = env.observation_space.shape
-action_dim = env.action_space.shape
+obs_dim = env.observation_space.shape[0]
+action_dim = env.action_space.shape[0]
+action_ub = env.action_space.high
+action_lb = env.action_space.low
 
-max_len = 10000  # replay_buffer size
+buffer_size = 10000  # replay_buffer size
+lstm_size = 256
+dense_size = 256
+seed = 1
 batch_size = 50
 critic_lr = 0.0001
 actor_lr = 0.0001
+target_network_update_rate = 0.005
+discount = 0.99
+noise_std = 0.1
 
 
 class RNNCritic(Model):
@@ -31,10 +40,8 @@ class RNNCritic(Model):
     def __init__(self, lstm_size, dense_size, name='RNNCritic'):
         super(RNNCritic, self).__init__(name=name)
 
-        self.lstm1 = LSTM(lstm_size, name="LSTM1")
-        self.dense1 = Dense(dense_size,
-                            name="HiddenDense",
-                            return_sequences=True)
+        self.lstm1 = LSTM(lstm_size, name="LSTM1", return_sequences=True)
+        self.dense1 = Dense(dense_size, name="HiddenDense")
         self.dense2 = Dense(1, name="OutputDense")
         self.concat = Concatenate()
 
@@ -55,7 +62,7 @@ class RNNActor(Model):
     action_history - (batch, T - 1, action_dim)
 
     Output:
-    action - (batch, action_dim)
+    action - (batch, T, action_dim)
     """
     def __init__(self,
                  action_dim,
@@ -69,7 +76,7 @@ class RNNActor(Model):
         self.action_lb = action_lb
         self.action_ub = action_ub
         self.action_dim = action_dim
-        self.lstm1 = LSTM(lstm_size, name="LSTM1")
+        self.lstm1 = LSTM(lstm_size, name="LSTM1", return_sequences=True)
         self.dense1 = Dense(dense_size, name="HiddenDense")
         self.dense2 = Dense(action_dim, name="OutputDense")
         self.concat = Concatenate()
@@ -77,6 +84,9 @@ class RNNActor(Model):
     def call(self, obs_history, action_history):
         batch_size = action_history.shape[0]
         action0 = tf.zeros([batch_size, 1, self.action_dim])
+        print(f"obs_hist shape: {obs_history.shape}")
+        print(f"action_hist shape: {action_history.shape}")
+        print(f"action0 shape: {action0.shape}")
         augmented_action_history = tf.concat([action0, action_history], axis=1)
 
         lstm_in = self.concat([obs_history, augmented_action_history])
@@ -165,17 +175,43 @@ class RNNReplayBuffer:
         return len(self.buffer)
 
 
-#  def construct_histories_actions_and_rewards(sequences):
-#      """
-#      return histories, acitons (next actions), rewards
-#      """
-#      pass
+def generate_action_noise(action_dim,
+                          action_upper_bound,
+                          action_lower_bound,
+                          noise_std,
+                          seed=None):
+    rng = np.random.default_rng(seed)
+    mean = np.zeros(action_dim)
+    span = action_upper_bound - action_lower_bound
+    cov = np.diag(noise_std * span)
+    noise = rng.multivariate_normal(mean, cov)
+    return tf.convert_to_tensor(noise, dtype=tf.float32)
 
-replay_buffer = RNNReplayBuffer(max_len)
+
+replay_buffer = RNNReplayBuffer(obs_dim,
+                                action_dim,
+                                capacity=buffer_size,
+                                seed=seed)
 critic_loss_fun = tf.keras.losses.MeanSquaredError()
 critic_optimizer = tf.keras.optimizers.Adam(learning_rate=critic_lr)
 actor_optimizer = tf.keras.optimizers.Adam(learning_rate=actor_lr)
-#  actor =
+
+critic = RNNCritic(lstm_size, dense_size)
+actor = RNNActor(action_dim,
+                 lstm_size,
+                 dense_size,
+                 action_lb=action_lb,
+                 action_ub=action_ub)
+target_critic = RNNCritic(lstm_size, dense_size)
+target_actor = RNNActor(action_dim,
+                        lstm_size,
+                        dense_size,
+                        action_lb=action_lb,
+                        action_ub=action_ub)
+
+# Making the weights equal
+target_actor.set_weights(actor.get_weights())
+target_critic.set_weights(critic.get_weights())
 
 for episode in range(num_episodes):
     history = History(obs_dim, action_dim)
@@ -183,13 +219,26 @@ for episode in range(num_episodes):
     sequence = []
     for t in range(num_steps):
         # TODO: noise generation
-        noise = 0
-        # actor is rnn model in tensorflow
-        action = actor(history.get_obs_history(),
-                       history.get_action_history()) + noise
+        noise = generate_action_noise(action_dim,
+                                      action_ub,
+                                      action_lb,
+                                      noise_std,
+                                      seed=seed)
+
+        if t == 0:
+            action = noise
+        else:
+            # add dummy batch dimension.
+            obs_history = tf.expand_dims(history.get_obs_history(), axis=0)
+            action_history = tf.expand_dims(history.get_action_history(),
+                                            axis=0)
+
+            action_seq = actor(obs_history, action_history)
+            action = action_seq[:, -1, :] + noise
 
         next_obs, reward, done, _ = env.step(action)
 
+        print_env_step_info(t, next_obs, action, reward)
         sequence.append((curr_obs, action, reward))
 
         history.insert_obs(curr_obs)
@@ -204,8 +253,6 @@ for episode in range(num_episodes):
     obs_history, action_history, reward_history = replay_buffer.sample(
         batch_size)
 
-    #  sample_histories, actions, rewards = construct_histories_actions_and_rewards(
-    #      sample_sequences)
     with tf.GradientTape() as tape:
         # obs_history: 1, ..., T; action_history: 1, ..., T-1
         # target_actions: 1, ..., T;
@@ -216,8 +263,8 @@ for episode in range(num_episodes):
 
         # reward_history 1, ..., T - 1, target_values 1, ..., T-1
         target_values = reward_history[:, :
-                                       -1] + gamma * target_critic_output[:,
-                                                                          1:, :]
+                                       -1] + discount * target_critic_output[:,
+                                                                             1:, :]
         # yhat 1, ..., T
         Qpredicts = critic(obs_history, action_history)
 
