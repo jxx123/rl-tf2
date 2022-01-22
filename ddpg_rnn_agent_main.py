@@ -35,7 +35,7 @@ class RNNCritic(Model):
     action_history - (batch, T, action_dim)
 
     Output:
-    value_sequence - (batch, T)
+    value_sequence - (batch, T, 1)
     """
     def __init__(self, lstm_size, dense_size, name='RNNCritic'):
         super(RNNCritic, self).__init__(name=name)
@@ -51,18 +51,19 @@ class RNNCritic(Model):
         x = self.dense1(lstm_out)
         x = self.dense2(x)
 
+        return x
         # squeeze the second dimension so that the output shape will be (batch, )
-        return tf.squeeze(x, axis=2)
+        #  return tf.squeeze(x, axis=2)
 
 
 class RNNActor(Model):
     """
     Input:
-    obs_history - (batch, T, obs_dim)
-    action_history - (batch, T - 1, action_dim)
+    obs_history - (batch, T, obs_dim) o_1, ..., o_T
+    action_history - (batch, T, action_dim) a_0, ..., a_(T-1)
 
     Output:
-    action - (batch, T, action_dim)
+    action - (batch, T, action_dim) a*_1, ..., a*_T
     """
     def __init__(self,
                  action_dim,
@@ -83,13 +84,13 @@ class RNNActor(Model):
 
     def call(self, obs_history, action_history):
         batch_size = action_history.shape[0]
-        action0 = tf.zeros([batch_size, 1, self.action_dim])
-        print(f"obs_hist shape: {obs_history.shape}")
-        print(f"action_hist shape: {action_history.shape}")
-        print(f"action0 shape: {action0.shape}")
-        augmented_action_history = tf.concat([action0, action_history], axis=1)
+        #  action0 = tf.zeros([batch_size, 1, self.action_dim])
+        # print(f"obs_hist shape: {obs_history.shape}")
+        # print(f"action_hist shape: {action_history.shape}")
+        # print(f"action0 shape: {action0.shape}")
+        #  augmented_action_history = tf.concat([action0, action_history], axis=1)
 
-        lstm_in = self.concat([obs_history, augmented_action_history])
+        lstm_in = self.concat([obs_history, action_history])
         x = self.lstm1(lstm_in)
 
         x = self.dense1(x)
@@ -114,7 +115,8 @@ class History:
 
     @staticmethod
     def _insert(hist, new_value):
-        new_value = tf.expand_dims(new_value, 0)
+        # hist is in tf.float32, hence cast new_value to tf.float32
+        new_value = tf.cast(tf.expand_dims(new_value, 0), dtype=tf.float32)
         return tf.concat([hist, new_value], 0)
 
     def insert_obs(self, obs):
@@ -124,7 +126,9 @@ class History:
         self.action_hist = self._insert(self.action_hist, action)
 
     def insert_reward(self, reward):
-        self.reward_hist = self._insert(self.reward_hist, reward)
+        # reward is a scalar, need to convert it to a tensor with 1 dimension
+        # first.
+        self.reward_hist = self._insert(self.reward_hist, [reward])
 
     def get_action_history(self):
         return self.action_hist
@@ -216,7 +220,14 @@ target_critic.set_weights(critic.get_weights())
 for episode in range(num_episodes):
     history = History(obs_dim, action_dim)
     curr_obs = env.reset()
-    sequence = []
+
+    # insert curr_obs and dummy action and reward, so the obs, action, reward
+    # history have the same sequence length.
+    history.insert_obs(curr_obs)
+    history.insert_action(tf.zeros([action_dim]))
+    history.insert_reward(0)
+
+    sum_reward = 0
     for t in range(num_steps):
         # TODO: noise generation
         noise = generate_action_noise(action_dim,
@@ -233,19 +244,27 @@ for episode in range(num_episodes):
             action_history = tf.expand_dims(history.get_action_history(),
                                             axis=0)
 
-            action_seq = actor(obs_history, action_history)
+            # o1, ..., oT; a0, ..., a_(T-1)
+            action_seq = actor(obs_history[:, 1:, :],
+                               action_history[:, :-1, :])
+
+            # Only the last action is needed.
             action = action_seq[:, -1, :] + noise
 
-        next_obs, reward, done, _ = env.step(action)
+            # need to squeeze the dummy batch dimension
+            action = tf.squeeze(action, axis=0)
 
-        print_env_step_info(t, next_obs, action, reward)
-        sequence.append((curr_obs, action, reward))
+        curr_obs, reward, done, _ = env.step(action)
+        sum_reward += reward
+        #  print_env_step_info(t, curr_obs, action, reward)
 
         history.insert_obs(curr_obs)
         history.insert_action(action)
         history.insert_reward(reward)
 
-        curr_obs = next_obs
+    print(f'Episode {episode}: reward sum = {sum_reward}')
+
+    # history, o_0, ..., o_T; a_0, ..., a_(T-1), a_T; r_0, ..., r_(T-1), r_T
 
     replay_buffer.put(history.get_obs_history(), history.get_action_history(),
                       history.get_reward_history())
@@ -254,31 +273,36 @@ for episode in range(num_episodes):
         batch_size)
 
     with tf.GradientTape() as tape:
-        # obs_history: 1, ..., T; action_history: 1, ..., T-1
+        # obs_history: 1, ..., T; action_history: 0, 1, ..., T-1
         # target_actions: 1, ..., T;
-        target_actions = target_actor(obs_history, action_history[:, :-1, :])
+        target_actions = target_actor(obs_history[:, 1:, :],
+                                      action_history[:, :-1, :])
 
-        # y1*, ..., yT*
-        target_critic_output = target_critic(obs_history, target_actions)
+        # y1*, ..., yT*; o1, ..., oT; a*_1, ..., a*_T
+        target_critic_output = target_critic(obs_history[:, 1:, :],
+                                             target_actions)
 
-        # reward_history 1, ..., T - 1, target_values 1, ..., T-1
+        # reward_history 0, 1, ..., T - 1, target_critic_output 1, ... T,
+        # target_values 0, ..., T - 1
         target_values = reward_history[:, :
-                                       -1] + discount * target_critic_output[:,
-                                                                             1:, :]
-        # yhat 1, ..., T
-        Qpredicts = critic(obs_history, action_history)
+                                       -1, :] + discount * target_critic_output
+
+        # yhat 0, ..., T - 1, obs_history 0, ... T - 1, aciton_history 0, ... T - 1
+        Qpredicts = critic(obs_history[:, :-1, :], action_history[:, :-1, :])
 
         critic_loss = critic_loss_fun(tf.stop_gradient(target_values),
-                                      Qpredicts[:, :-1, :])
+                                      Qpredicts)
 
     critic_gradients = tape.gradient(critic_loss, critic.trainable_variables)
     critic_optimizer.apply_gradients(
         zip(critic_gradients, critic.trainable_variables))
 
     with tf.GradientTape() as tape:
-        # action_history: 1, ..., T-1, actor_actions: 1, ..., T
-        actor_actions = actor(obs_history, action_history[:, :-1, :])
-        actor_loss = -tf.math.reduce_mean(critic(obs_history, actor_actions))
+        # obs_history: 1, ..., T, action_history: 0, 1, ..., T-1,
+        # actor_actions: 1, ..., T
+        actor_actions = actor(obs_history[:, 1:, :], action_history[:, :-1, :])
+        actor_loss = -tf.math.reduce_mean(
+            critic(obs_history[:, 1:, :], actor_actions))
 
     actor_gradients = tape.gradient(actor_loss, actor.trainable_variables)
     actor_optimizer.apply_gradients(
